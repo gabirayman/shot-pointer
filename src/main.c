@@ -2,11 +2,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2s_std.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 
 #include <math.h>
 
-#define CAPTURE_SIZE 4096
+#define CAPTURE_SIZE 8192*2
 
 // Global buffers to hold the frozen snapshot of the sound
 float captured_left[CAPTURE_SIZE];
@@ -32,7 +33,11 @@ int post_trigger_count = 0;
 #define I2S_SD_IO       (6)
 
 // INMP441 configuration
-#define I2S_SAMPLE_RATE (16000)
+#define I2S_SAMPLE_RATE (48000)
+
+// -----------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------
 
 // Function to calculate RMS amplitude
 float calculate_rms(int32_t *buffer, int num_samples, int channel_offset) {
@@ -43,6 +48,46 @@ float calculate_rms(int32_t *buffer, int num_samples, int channel_offset) {
         sum_squares += (sample * sample);
     }
     return sqrt(sum_squares / (num_samples / 2));
+}
+
+
+// Mathematical Cross-Correlation
+int calculate_sample_delay(int ring_head, int capture_size) {
+    // 1. We know the trigger happened exactly at the halfway point.
+    // Let's create a "window" of 512 samples right around that explosion.
+    int window_size = 512;
+    int center_point = capture_size / 2;
+    int start_offset = center_point - 100; // Start slightly before the peak hits
+
+    // 2. How far should we slide the arrays against each other?
+    // At 16,000 Hz, sound travels ~2.1cm per sample. 
+    // Checking +/- 50 samples covers over a meter of physical distance.
+    int max_shift = 50; 
+    
+    float max_dot_product = 0;
+    int best_shift = 0;
+
+    // 3. Slide the Right channel back and forth against the Left channel
+    for (int shift = -max_shift; shift <= max_shift; shift++) {
+        float dot_product = 0;
+
+        for (int i = 0; i < window_size; i++) {
+            // Calculate the true circular index, wrapping around if necessary
+            int left_idx = (ring_head + start_offset + i) % capture_size;
+            int right_idx = (ring_head + start_offset + i + shift) % capture_size;
+
+            // Multiply the overlapping samples together
+            dot_product += captured_left[left_idx] * captured_right[right_idx];
+        }
+
+        // Is this the best alignment we've seen so far?
+        if (dot_product > max_dot_product) {
+            max_dot_product = dot_product;
+            best_shift = shift;
+        }
+    }
+    
+    return best_shift;
 }
 
 void i2s_microphone_task(void *pvParameters) {
@@ -96,7 +141,7 @@ void i2s_microphone_task(void *pvParameters) {
     size_t bytes_read = 0;
 
     // Threshold for triggering the post-trigger recording state. 
-    float THRESHOLD = 3000000.0;
+    float THRESHOLD = 2000000.0;
 
     while (1) {
         // This function blocks until the DMA ring buffer has 'bytes_to_read' available.
@@ -148,21 +193,27 @@ void i2s_microphone_task(void *pvParameters) {
                 }
 
             } else if (current_state == STATE_PROCESSING) {
-                // The audio is now frozen
-                // here we will do the tdoa processing
-                // for now just print
-                printf("Audio captured! Ready for math.\n");
-                // print out the left buffer for testing
-                for (int i = 0; i < CAPTURE_SIZE; i++) {
-                    // start at the current ring index to print in order
-                    int idx = (ring_index + i) % CAPTURE_SIZE;
-                    printf(">Left:%.2f\n", captured_left[idx]);
-                    // pet the watchdog every 500 prints to avoid triggering it during this long processing loop
-                    if (i % 500 == 0) {
-                        vTaskDelay(pdMS_TO_TICKS(10)); 
-                    }
+                printf("Audio captured! Running Cross-Correlation...\n");
+                
+                // Do the math
+                int sample_delay = calculate_sample_delay(ring_index, CAPTURE_SIZE);
+                
+                printf("-----------------------------------\n");
+                printf("Calculated Sample Delay: %d samples\n", sample_delay);
+                
+                if (sample_delay > 0) {
+                    printf("Result: Sound arrived at LEFT mic first.\n");
+                    printf("Sample delay: %d", sample_delay);
+                } else if (sample_delay < 0) {
+                    printf("Result: Sound arrived at RIGHT mic first.\n");
+                    printf("Sample delay: %d", sample_delay);
+                } else {
+                    printf("Result: Sound arrived DEAD CENTER.\n");
+                    printf("Sample delay: %d", sample_delay);
                 }
-
+                printf("-----------------------------------\n\n");
+                
+                // Pause so you can read the terminal, then reset to listen again
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 current_state = STATE_LISTENING;
             }
