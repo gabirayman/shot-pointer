@@ -4,6 +4,28 @@
 #include "driver/i2s_std.h"
 #include "esp_err.h"
 
+#include <math.h>
+
+#define CAPTURE_SIZE 4096
+
+// Global buffers to hold the frozen snapshot of the sound
+float captured_left[CAPTURE_SIZE];
+float captured_right[CAPTURE_SIZE];
+
+typedef enum {
+    STATE_LISTENING,       // Constantly filling the ring buffer, waiting for a loud noise
+    STATE_POST_TRIGGER,    // Trigger hit! Recording the tail end of the sound
+    STATE_PROCESSING       // Buffer frozen. Ready for Cross-Correlation.
+} system_state_t;
+
+system_state_t current_state = STATE_LISTENING;
+
+
+
+// The rolling index for our circular buffer
+int ring_index = 0; 
+int post_trigger_count = 0;
+
 // Hardware Pin Definitions
 #define I2S_SCK_IO      (4)
 #define I2S_WS_IO       (5)
@@ -11,6 +33,17 @@
 
 // INMP441 configuration
 #define I2S_SAMPLE_RATE (16000)
+
+// Function to calculate RMS amplitude
+float calculate_rms(int32_t *buffer, int num_samples, int channel_offset) {
+    float sum_squares = 0;
+    // channel_offset: 0 for Left, 1 for Right
+    for (int i = 0; i < num_samples; i += 2) {
+        float sample = (float)(buffer[i + channel_offset] >> 8);
+        sum_squares += (sample * sample);
+    }
+    return sqrt(sum_squares / (num_samples / 2));
+}
 
 void i2s_microphone_task(void *pvParameters) {
     i2s_chan_handle_t rx_handle;
@@ -62,6 +95,9 @@ void i2s_microphone_task(void *pvParameters) {
     int32_t *raw_samples = (int32_t *)malloc(bytes_to_read);
     size_t bytes_read = 0;
 
+    // Threshold for triggering the post-trigger recording state. 
+    float THRESHOLD = 3000000.0;
+
     while (1) {
         // This function blocks until the DMA ring buffer has 'bytes_to_read' available.
         // During this time, the CPU is yielded to other FreeRTOS tasks.
@@ -69,24 +105,97 @@ void i2s_microphone_task(void *pvParameters) {
 
         if (res == ESP_OK && bytes_read > 0) {
             int total_samples = bytes_read / sizeof(int32_t);
-            
-            int32_t max_left = 0;
-            int32_t max_right = 0;
 
-            // Loop through the interleaved buffer
-            // i increments by 2 to jump from frame to frame
-            for (int i = 0; i < total_samples; i += 2) {
-                // Extract and shift
-                int32_t current_left = raw_samples[i] >> 8;
-                int32_t current_right = raw_samples[i+1] >> 8;
+            if (current_state == STATE_LISTENING) {
+                // calculate the RMS (energy) of the current chunk
+                float rms_left = calculate_rms(raw_samples, total_samples, 0);
 
-                // find the max value in this batch for both channels to get a sense of the amplitude
-                if (abs(current_left) > max_left) max_left = abs(current_left);
-                if (abs(current_right) > max_right) max_right = abs(current_right);
+                // If the energy exceeds our threshold
+                if (rms_left > THRESHOLD) {
+                    current_state = STATE_POST_TRIGGER;
+                    post_trigger_count = 0; // reset post-trigger counter
+                    // In production we will take out prints to save processing time.
+                    printf("Trigger hit! RMS: %.2f\n", rms_left);
+                }
+
+                //either way we save the current chunk into our circular buffer
+                for (int i = 0; i < total_samples; i += 2) {
+                    captured_left[ring_index] = (float)(raw_samples[i] >> 8);
+                    captured_right[ring_index] = (float)(raw_samples[i+1] >> 8);
+                    
+                    ring_index++;
+                    if (ring_index >= CAPTURE_SIZE) {
+                        ring_index = 0; // Wrap around!
+                    }
+                }
+            } else if (current_state == STATE_POST_TRIGGER) {
+                // We are in the post-trigger state, so we want to keep filling our buffer until we have captured enough tail end audio
+                for (int i = 0; i < total_samples; i += 2) {
+                    captured_left[ring_index] = (float)(raw_samples[i] >> 8);
+                    captured_right[ring_index] = (float)(raw_samples[i+1] >> 8);
+                    
+                    ring_index++;
+                    if (ring_index >= CAPTURE_SIZE) {
+                        ring_index = 0; // Wrap around!
+                    }
+                }
+
+                post_trigger_count += total_samples / 2; // since samples are interleaved stereo, we divide by 2
+
+                if (post_trigger_count >= (CAPTURE_SIZE / 2)) { 
+                    current_state = STATE_PROCESSING;
+                    printf("Post-trigger capture complete. Buffer frozen for processing.\n");
+                }
+
+            } else if (current_state == STATE_PROCESSING) {
+                // The audio is now frozen
+                // here we will do the tdoa processing
+                // for now just print
+                printf("Audio captured! Ready for math.\n");
+                // print out the left buffer for testing
+                for (int i = 0; i < CAPTURE_SIZE; i++) {
+                    // start at the current ring index to print in order
+                    int idx = (ring_index + i) % CAPTURE_SIZE;
+                    printf(">Left:%.2f\n", captured_left[idx]);
+                    // pet the watchdog every 500 prints to avoid triggering it during this long processing loop
+                    if (i % 500 == 0) {
+                        vTaskDelay(pdMS_TO_TICKS(10)); 
+                    }
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                current_state = STATE_LISTENING;
             }
+            
 
-            printf(">Left_Peak:%ld\n", max_left);
-            printf(">Right_Peak:%ld\n", max_right);
+
+            // // We will now test and see when quite how much the buffer's rms is so we can set a threshold for triggering the post-trigger recording state.
+            // float rms_left = calculate_rms(raw_samples, total_samples, 0);
+            // float rms_right = calculate_rms(raw_samples, total_samples, 1);
+            
+            // printf(">Left_rms:%.2f\n", rms_left);
+            // printf(">Right_rms:%.2f\n", rms_right);
+
+
+
+
+            // int32_t max_left = 0;
+            // int32_t max_right = 0;
+
+            // // Loop through the interleaved buffer
+            // // i increments by 2 to jump from frame to frame
+            // for (int i = 0; i < total_samples; i += 2) {
+            //     // Extract and shift
+            //     int32_t current_left = raw_samples[i] >> 8;
+            //     int32_t current_right = raw_samples[i+1] >> 8;
+
+            //     // find the max value in this batch for both channels to get a sense of the amplitude
+            //     if (abs(current_left) > max_left) max_left = abs(current_left);
+            //     if (abs(current_right) > max_right) max_right = abs(current_right);
+            // }
+
+            // printf(">Left_Peak:%ld\n", max_left);
+            // printf(">Right_Peak:%ld\n", max_right);
             
         }
         
