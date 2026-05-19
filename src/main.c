@@ -150,7 +150,15 @@ void i2s_microphone_task(void *pvParameters) {
     // Set the pins as outputs
     gpio_set_direction(RIGHT_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_direction(LEFT_GPIO, GPIO_MODE_OUTPUT);
-    // Ensure LEDs are off at start
+    // blink at start to indicate we're alive
+    for (int i = 0; i < 3; i++) {
+                        gpio_set_level(RIGHT_GPIO, 1);
+                        gpio_set_level(LEFT_GPIO, 0);
+                        vTaskDelay(250 / portTICK_PERIOD_MS);
+                        gpio_set_level(RIGHT_GPIO, 0);
+                        gpio_set_level(LEFT_GPIO, 1);
+                        vTaskDelay(250 / portTICK_PERIOD_MS);
+                    }
     gpio_set_level(RIGHT_GPIO, 0);
     gpio_set_level(LEFT_GPIO, 0);
 
