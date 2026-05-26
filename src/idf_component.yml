@@ -1,3 +1,4 @@
 dependencies:
   espressif/esp-dsp:
     version: "^1.8.2"
+  k0i05/esp_ssd1306: "1.2.7"

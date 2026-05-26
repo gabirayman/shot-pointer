@@ -2,7 +2,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2s_std.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
+
+// oled display library
+#include "ssd1306.h"
+
+#define I2C_SCL 10
+#define I2C_SDA 11
 
 // dsp library
 #include "esp_dsp.h"
@@ -161,6 +168,38 @@ void i2s_microphone_task(void *pvParameters) {
                     }
     gpio_set_level(RIGHT_GPIO, 0);
     gpio_set_level(LEFT_GPIO, 0);
+    
+    // 1. Initialize modern I2C Master Bus (if you haven't already for your other tasks)
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = I2C_SDA,
+        .scl_io_num = I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    
+    i2c_master_bus_handle_t i2c_bus_hdl;
+    i2c_new_master_bus(&bus_cfg, &i2c_bus_hdl);
+
+    // 2. Initialize the OLED
+    ssd1306_config_t dev_cfg = I2C_SSD1306_128x64_CONFIG_DEFAULT;
+    ssd1306_handle_t dev_hdl;
+    
+    ssd1306_init(i2c_bus_hdl, &dev_cfg, &dev_hdl);
+
+    if (dev_hdl != NULL) {
+        // 3. Clear, Contrast, and Text (Using the corrected v1.2.7 API)
+        ssd1306_clear_display(dev_hdl, false);
+        ssd1306_set_contrast(dev_hdl, 0xFF);
+        
+        // No strlen() needed, just pass the string directly
+        ssd1306_display_text(dev_hdl, 0, "Listening...", false); 
+        // ssd1306_display_text(dev_hdl, 2, "ESP32-S3 Ready", false);
+
+    } else {
+        printf("SSD1306 Init Failed\n");
+    }
 
     while (1) {
         // This function blocks until the DMA ring buffer has 'bytes_to_read' available.
@@ -234,12 +273,31 @@ void i2s_microphone_task(void *pvParameters) {
 
                     printf("Result: Sound arrived from the RIGHT side.\n");
                     printf("Sample delay: %d samples\n", sample_delay);
+
+                    char display_buf[32]; // Buffer to hold the formatted string
+
+                    // Format the string, save it into the buffer
+                    snprintf(display_buf, sizeof(display_buf), "Delay: %d", sample_delay);
+
+                    ssd1306_clear_display(dev_hdl, false);
+                    ssd1306_display_text(dev_hdl, 0, "Right ->", false);
+                    ssd1306_display_text(dev_hdl, 2, display_buf, false);
                 } else if (sample_delay < 0) {
                     gpio_set_level(LEFT_GPIO, 1);
                     printf("Result: Sound arrived from the LEFT side.\n");
                     printf("Sample delay: %d samples\n", sample_delay);
+
+                    char display_buf[32]; // Buffer to hold the formatted string
+
+                    // Format the string, save it into the buffer
+                    snprintf(display_buf, sizeof(display_buf), "Delay: %d", sample_delay);
+                    ssd1306_clear_display(dev_hdl, false);
+                    ssd1306_display_text(dev_hdl, 0, "Left <-", false);
+                    ssd1306_display_text(dev_hdl, 2, display_buf, false);
                 } else {
                     printf("Result: Sound arrived DEAD CENTER.\n");
+                    ssd1306_clear_display(dev_hdl, false);
+                    ssd1306_display_text(dev_hdl, 0, "Center", false);
                     //alternating fast blink both LEDs for center
                     for (int i = 0; i < 3; i++) {
                         gpio_set_level(RIGHT_GPIO, 1);
@@ -285,6 +343,9 @@ void i2s_microphone_task(void *pvParameters) {
                 // turn off all leds
                 gpio_set_level(RIGHT_GPIO, 0);
                 gpio_set_level(LEFT_GPIO, 0);
+
+                // ssd1306_clear_display(dev_hdl, false);
+                ssd1306_display_text(dev_hdl, 4, "Listening...", false);
                 current_state = STATE_LISTENING;
             }
             
