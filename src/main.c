@@ -310,34 +310,6 @@ void i2s_microphone_task(void *pvParameters) {
                 }
                 printf("-----------------------------------\n\n");
                 
-                // ------------------------------------------
-                // section for visualizing the captured audio in the serial plotter
-                // ------------------------------------------
-
-                // // ring_index points to the NEXT index to be written to.
-                // // This means ring_index is currently pointing at the OLDEST sample in our buffer.
-                // int read_idx = ring_index;
-
-                // // Loop through the entire buffer exactly once
-                // for (int i = 0; i < CAPTURE_SIZE; i++) {
-                    
-                //     // Print in Teleplot format: >SeriesName:Value
-                //     printf(">Left:%.2f\n", captured_left[read_idx]);
-                //     printf(">Right:%.2f\n", captured_right[read_idx]);
-                    
-                //     // Advance the index and wrap around the circular buffer
-                //     read_idx++;
-                //     if (read_idx >= CAPTURE_SIZE) {
-                //         read_idx = 0;
-                //     }
-
-                //     // Optional: A tiny delay to prevent overwhelming the serial buffer
-                //     // If your serial monitor drops characters, uncomment the line below.
-                //     vTaskDelay(pdMS_TO_TICKS(1)); 
-                // }
-
-                // printf("Dump complete. Pausing for 1 second...\n");
-                
                 // Pause so you can read the terminal, then reset to listen again
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 // turn off all leds
