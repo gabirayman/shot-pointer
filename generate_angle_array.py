@@ -3,7 +3,7 @@ import math
 # --- Physical Constants ---
 SPEED_OF_SOUND = 343.0      # meters per second
 SAMPLE_RATE = 48000.0       # Hz
-SIDE_LENGTH = 0.20          # 20 cm between mics
+SIDE_LENGTH = 0.22          # 22 cm between mics
 
 # In an equilateral triangle, the distance from the center to any mic (Radius) is:
 # R = Side / sqrt(3)
@@ -32,9 +32,9 @@ def calculate_lut():
         
         # Calculate time difference in seconds, then convert to samples
         # Delay = (Dist A - Dist B) / Speed of Sound * Sample Rate
-        delay12 = round(((d1 - d2) / SPEED_OF_SOUND) * SAMPLE_RATE)
-        delay23 = round(((d2 - d3) / SPEED_OF_SOUND) * SAMPLE_RATE)
-        delay31 = round(((d3 - d1) / SPEED_OF_SOUND) * SAMPLE_RATE)
+        delay12 = round(((d2 - d1) / SPEED_OF_SOUND) * SAMPLE_RATE)
+        delay23 = round(((d3 - d2) / SPEED_OF_SOUND) * SAMPLE_RATE)
+        delay31 = round(((d1 - d3) / SPEED_OF_SOUND) * SAMPLE_RATE)
         
         # Print in C array format
         print(f"    {{{delay12:3}, {delay23:3}, {delay31:3}}}, // {angle} deg")

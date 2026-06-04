@@ -7,6 +7,7 @@
 #include "esp_err.h"
 #include "esp_dsp.h"
 #include "ssd1306.h"
+#include "tdoa_lut.h" // Include the TDOA lookup table tdoa_lut[360][3] where tdoa_lut[angle][delays]
 
 // ============================================================================
 //  HARDWARE PIN DEFINITIONS
@@ -20,7 +21,7 @@
 #define I2S_SCK_IO       (4)  // Shared Clock
 #define I2S_WS_IO        (5)  // Shared Word Select (L/R clock)
 #define I2S_SD_MICS_1_2  (6)  // Data pin for Mics 1 & 2
-// FUTURE: #define I2S_SD_MIC_3 (7) // Data pin for 3rd Mic
+#define I2S_SD_MIC_3 (7)      // Data pin for 3rd Mic
 
 // ============================================================================
 //  AUDIO & DSP CONFIGURATION
@@ -44,15 +45,28 @@ typedef enum {
 
 system_state_t current_state = STATE_LISTENING;
 
+// Raw sample buffers for I2S
+// 256 samples * 4 bytes = 1024 bytes
+int32_t raw_samples_master[256]; 
+int32_t raw_samples_slave[256];
+
 // Circular buffers for continuous capture
-float captured_left[CAPTURE_SIZE];
-float captured_right[CAPTURE_SIZE];
-// FUTURE: float captured_mic3[CAPTURE_SIZE];
+float captured_mic_0[CAPTURE_SIZE];
+float captured_mic_120[CAPTURE_SIZE];
+float captured_mic_240[CAPTURE_SIZE];
+
+// alias for old name backwards compatibility with existing code
+#define captured_left captured_mic_0
+#define captured_right captured_mic_120
 
 // Linear buffers for DSP processing
-float linear_left[CAPTURE_SIZE];
-float linear_right[CAPTURE_SIZE];
-// FUTURE: float linear_mic3[CAPTURE_SIZE];
+float linear_mic_0[CAPTURE_SIZE];
+float linear_mic_120[CAPTURE_SIZE];
+float linear_mic_240[CAPTURE_SIZE];
+
+//alias for old name backwards compatibility with existing code
+#define linear_left linear_mic_0
+#define linear_right linear_mic_120
 
 int ring_index = 0; 
 int post_trigger_count = 0;
@@ -64,9 +78,12 @@ ssd1306_handle_t dev_hdl = NULL;
 //  GLOBAL STATE & BUFFERS FOR FFT APPROACH
 // ============================================================================
 
-float buffer_A[CAPTURE_SIZE * 2];
-float buffer_B[CAPTURE_SIZE * 2];
+float buffer_fft_0[CAPTURE_SIZE * 2];
+float buffer_fft_120[CAPTURE_SIZE * 2];
+float buffer_fft_240[CAPTURE_SIZE * 2];
 float cross_corr_buffer[CAPTURE_SIZE * 2];
+
+
 
 // ============================================================================
 //  HARDWARE INITIALIZATION HELPERS
@@ -130,6 +147,61 @@ i2s_chan_handle_t init_i2s_microphones() {
     return rx_handle_master;
 }
 
+void init_microphones_multichannel(i2s_chan_handle_t *master_hdl, i2s_chan_handle_t *slave_hdl) {
+
+    // Allocate Channels
+
+    // Master for Mics 1 & 2
+    i2s_chan_config_t chan_cfg_master = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg_master, NULL, master_hdl));
+
+    // Slave for Mic 3
+    i2s_chan_config_t chan_cfg_slave = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_SLAVE);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg_slave, NULL, slave_hdl));
+
+    // Configure Master (Mics 1 & 2)
+    i2s_std_config_t std_cfg_master = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_SCK_IO,       // MASTER GENERATES CLOCK HERE
+            .ws   = I2S_WS_IO,        // MASTER GENERATES WS HERE
+            .dout = I2S_GPIO_UNUSED,
+            .din  = I2S_SD_MICS_1_2,  // Data pin for Mics 1 & 2
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(*master_hdl, &std_cfg_master));
+
+
+    // Configure Slave (Mic 3)
+    i2s_std_config_t std_cfg_slave = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_SCK_IO,       // SLAVE READS CLOCK FROM HERE
+            .ws   = I2S_WS_IO,        // SLAVE READS WS FROM HERE
+            .dout = I2S_GPIO_UNUSED,
+            .din  = I2S_SD_MIC_3,     // Data pin for Mic 3
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(*slave_hdl, &std_cfg_slave));
+
+    // Enable Channels (Slave first to sync to Master's clock)
+
+    // Slave
+    ESP_ERROR_CHECK(i2s_channel_enable(*slave_hdl));
+
+    // Master
+    ESP_ERROR_CHECK(i2s_channel_enable(*master_hdl));
+
+    printf("I2S channels initialized successfully.\n");
+
+}
+
 
 // ============================================================================
 //  DSP & MATH HELPERS
@@ -144,17 +216,17 @@ float calculate_energy(int32_t *buffer, int num_samples, int channel_offset) {
     return sum_squares / (num_samples / 2);
 }
 
-int calculate_sample_delay() {
+int calculate_sample_delay(float *linear_a, float *linear_b) {
     float max_dot_product = -99999999.0f;
     int best_shift = 0;
     int analysis_start = (CAPTURE_SIZE / 2) - 100;
 
     for (int shift = -MAX_PHYSICAL_SHIFT; shift <= MAX_PHYSICAL_SHIFT; shift++) {
         float dot_product = 0;
-        float *ptr_left = &linear_left[analysis_start];
-        float *ptr_right = &linear_right[analysis_start + shift];
+        float *ptr_a = &linear_a[analysis_start];
+        float *ptr_b = &linear_b[analysis_start + shift];
 
-        dsps_dotprod_f32(ptr_left, ptr_right, &dot_product, WINDOW_SIZE);
+        dsps_dotprod_f32(ptr_a, ptr_b, &dot_product, WINDOW_SIZE);
         
         if (dot_product > max_dot_product) {
             max_dot_product = dot_product;
@@ -164,7 +236,9 @@ int calculate_sample_delay() {
     return best_shift;
 }
 
-int calculate_sample_delay_fft() {
+
+
+int calculate_sample_delay_fft(float *buffer_A, float *buffer_B) {
     // Forward FFTs 
     dsps_fft4r_fc32(buffer_A, CAPTURE_SIZE);
     dsps_fft4r_fc32(buffer_B, CAPTURE_SIZE);
@@ -244,18 +318,23 @@ int calculate_sample_delay_fft() {
 // ============================================================================
 
 void i2s_microphone_task(void *pvParameters) {
-    init_oled_display();
-    i2s_chan_handle_t rx_handle = init_i2s_microphones();
 
-    size_t bytes_to_read = 1024;
-    int32_t *raw_samples = (int32_t *)malloc(bytes_to_read);
-    size_t bytes_read = 0;
+    // Initialize oled
+    init_oled_display();
+
+    // Initialize I2S
+    // i2s_chan_handle_t rx_handle = init_i2s_microphones();
+    i2s_chan_handle_t rx_handle_master, rx_handle_slave;
+    init_microphones_multichannel(&rx_handle_master, &rx_handle_slave);
+
+    size_t bytes_read_master = 0;
+    size_t bytes_read_slave = 0;
 
     ssd1306_clear_display(dev_hdl, false);
     ssd1306_display_text(dev_hdl, 0, "Listening...", false);
 
     // Initialize the complex FFT tables. 
-    // Do this ONCE at boot before running any acoustic calculations
+    // Do this once 
     esp_err_t ret = dsps_fft4r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
     
     if (ret != ESP_OK) {
@@ -265,28 +344,35 @@ void i2s_microphone_task(void *pvParameters) {
 
     while (1) {
         // Read from I2S Master
-        esp_err_t res = i2s_channel_read(rx_handle, raw_samples, bytes_to_read, &bytes_read, portMAX_DELAY);
+        esp_err_t res = i2s_channel_read(rx_handle_master, raw_samples_master, sizeof(raw_samples_master), &bytes_read_master, portMAX_DELAY);
         
-        // FUTURE: Immediately read from I2S Slave here (timeout 0)
+        // Immediately read from I2S Slave
+        esp_err_t res_slave = i2s_channel_read(rx_handle_slave, raw_samples_slave, sizeof(raw_samples_slave), &bytes_read_slave, portMAX_DELAY);
 
-        if (res == ESP_OK && bytes_read > 0) {
-            int total_samples = bytes_read / sizeof(int32_t);
+        if (res == ESP_OK && bytes_read_master > 0 && res_slave == ESP_OK && bytes_read_slave > 0) {
+            if (bytes_read_master != bytes_read_slave) {
+                printf("Warning: Mismatch in bytes read between Master and Slave! Master: %d, Slave: %d\n", bytes_read_master, bytes_read_slave);
+            }
+
+            int total_samples = bytes_read_master / sizeof(int32_t);
 
             // --- STATE: LISTENING ---
             if (current_state == STATE_LISTENING) {
-                float energy_left = calculate_energy(raw_samples, total_samples, 0);
-                float energy_right = calculate_energy(raw_samples, total_samples, 1);
+                float energy_0 = calculate_energy(raw_samples_master, total_samples, 1);
+                float energy_120 = calculate_energy(raw_samples_master, total_samples, 0);
+                float energy_240 = calculate_energy(raw_samples_slave, total_samples, 1);
 
-                if (energy_left > TRIGGER_THRESHOLD || energy_right > TRIGGER_THRESHOLD) {
+                if (energy_0 > TRIGGER_THRESHOLD || energy_120 > TRIGGER_THRESHOLD || energy_240 > TRIGGER_THRESHOLD) {
                     current_state = STATE_POST_TRIGGER;
                     post_trigger_count = 0;
                 }
 
                 // Fill circular buffer
                 for (int i = 0; i < total_samples; i += 2) {
-                    captured_left[ring_index] = (float)(raw_samples[i] >> 8);
-                    captured_right[ring_index] = (float)(raw_samples[i+1] >> 8);
-                    
+                    captured_mic_0[ring_index] = (float)(raw_samples_master[i+1] >> 8);
+                    captured_mic_120[ring_index] = (float)(raw_samples_master[i] >> 8);
+                    captured_mic_240[ring_index] = (float)(raw_samples_slave[i+1] >> 8);
+
                     ring_index = (ring_index + 1) % CAPTURE_SIZE;
                 }
             } 
@@ -294,8 +380,9 @@ void i2s_microphone_task(void *pvParameters) {
             // --- STATE: POST-TRIGGER CAPTURE ---
             else if (current_state == STATE_POST_TRIGGER) {
                 for (int i = 0; i < total_samples; i += 2) {
-                    captured_left[ring_index] = (float)(raw_samples[i] >> 8);
-                    captured_right[ring_index] = (float)(raw_samples[i+1] >> 8);
+                    captured_mic_0[ring_index] = (float)(raw_samples_master[i+1] >> 8);
+                    captured_mic_120[ring_index] = (float)(raw_samples_master[i] >> 8);
+                    captured_mic_240[ring_index] = (float)(raw_samples_slave[i+1] >> 8);
                     
                     ring_index = (ring_index + 1) % CAPTURE_SIZE;
                 }
@@ -312,40 +399,94 @@ void i2s_microphone_task(void *pvParameters) {
                 // Linearize buffer
                 int src_idx = ring_index;
                 for (int dst_idx = 0; dst_idx < CAPTURE_SIZE; dst_idx++) {
-                    linear_left[dst_idx]  = captured_left[src_idx];
-                    linear_right[dst_idx] = captured_right[src_idx];
-                    
+                    linear_mic_0[dst_idx]  = captured_mic_0[src_idx];
+                    linear_mic_120[dst_idx] = captured_mic_120[src_idx];
+                    linear_mic_240[dst_idx] = captured_mic_240[src_idx];
+
                     src_idx = (src_idx + 1) % CAPTURE_SIZE;
                 }
                 
                 // populate the complex buffers for FFT processing (Interleaved Real/Imaginary)
                 for (int i = 0; i < CAPTURE_SIZE; i++) {
-                    buffer_A[i * 2 + 0] = linear_left[i];  // Real component (Audio)
-                    buffer_A[i * 2 + 1] = 0.0f;            // Imaginary component
+                    buffer_fft_0[i * 2 + 0] = linear_mic_0[i];  // Real component (Audio)
+                    buffer_fft_0[i * 2 + 1] = 0.0f;            // Imaginary component
                     
-                    buffer_B[i * 2 + 0] = linear_right[i]; // Real component (Audio)
-                    buffer_B[i * 2 + 1] = 0.0f;            // Imaginary component
+                    buffer_fft_120[i * 2 + 0] = linear_mic_120[i]; // Real component (Audio)
+                    buffer_fft_120[i * 2 + 1] = 0.0f;            // Imaginary component
+
+                    buffer_fft_240[i * 2 + 0] = linear_mic_240[i]; // Real component (Audio)
+                    buffer_fft_240[i * 2 + 1] = 0.0f;            // Imaginary component
                 }
 
-                // Run Cross-Correlation
-                int sample_delay = calculate_sample_delay();
-                int sample_delay_fft = calculate_sample_delay_fft();
+                // Run Cross-Correlation using both methods for comparison
 
-                char display_buf[32];
-                snprintf(display_buf, sizeof(display_buf), "Delay: %d", sample_delay);
+                int delay_0_120 = calculate_sample_delay(linear_mic_0, linear_mic_120); // tdoa_lut[i][0] is mic 0 to mic 120 delay
+                int delay_120_240 = calculate_sample_delay(linear_mic_120, linear_mic_240); // tdoa_lut[i][1] is mic 120 to mic 240 delay
+                int delay_240_0 = calculate_sample_delay(linear_mic_240, linear_mic_0); // tdoa_lut[i][2] is mic 240 to mic 0 delay
 
-                // Update OLED based on results
+                int delay_0_120_fft = calculate_sample_delay_fft(buffer_fft_0, buffer_fft_120); // tdoa_lut[i][0] is mic 0 to mic 120 delay
+                int delay_120_240_fft = calculate_sample_delay_fft(buffer_fft_120, buffer_fft_240); // tdoa_lut[i][1] is mic 120 to mic 240 delay
+                int delay_240_0_fft = calculate_sample_delay_fft(buffer_fft_240, buffer_fft_0); // tdoa_lut[i][2] is mic 240 to mic 0 delay
+
+                // find degree index in LUT that best matches our observed delays
+                int best_angle_index = 0;
+                int min_error = 999999;
+                int best_angle_index_fft = 0;
+                int min_error_fft = 999999;
+                for (int i = 0; i < 360; i++) {
+                    int error = abs(tdoa_lut[i][0] - delay_0_120) + abs(tdoa_lut[i][1] - delay_120_240) + abs(tdoa_lut[i][2] - delay_240_0);
+                    if (error < min_error) {
+                        min_error = error;
+                        best_angle_index = i;
+                    }
+                    int error_fft = abs(tdoa_lut[i][0] - delay_0_120_fft) + abs(tdoa_lut[i][1] - delay_120_240_fft) + abs(tdoa_lut[i][2] - delay_240_0_fft);
+                    if (error_fft < min_error_fft) {
+                        min_error_fft = error_fft;
+                        best_angle_index_fft = i;
+                    }
+                }
+
+                // print results to oled
                 ssd1306_clear_display(dev_hdl, false);
-                if (sample_delay > 0) {
-                    ssd1306_display_text(dev_hdl, 0, "Right ->", false);
-                } else if (sample_delay < 0) {
-                    ssd1306_display_text(dev_hdl, 0, "Left <-", false);
-                } else {
-                    ssd1306_display_text(dev_hdl, 0, "Center", false);
-                }
+                ssd1306_display_text(dev_hdl, 0, "Regular:", false);
+                char display_buf[32];
+                snprintf(display_buf, sizeof(display_buf), "Angle: %d deg", best_angle_index);
                 ssd1306_display_text(dev_hdl, 2, display_buf, false);
-                snprintf(display_buf, sizeof(display_buf), "FFT Delay: %d", sample_delay_fft);
-                ssd1306_display_text(dev_hdl, 4, display_buf, false);
+                ssd1306_display_text(dev_hdl, 4, "FFT:", false);
+                snprintf(display_buf, sizeof(display_buf), "Angle: %d deg", best_angle_index_fft);
+                ssd1306_display_text(dev_hdl, 6, display_buf, false);
+                
+
+                // print to console for debugging
+                printf("Cross-Correlation Delays (Samples): Mic0-120: %d, Mic120-240: %d, Mic240-0: %d\n", delay_0_120, delay_120_240, delay_240_0);
+                printf("FFT Cross-Correlation Delays (Samples): Mic0-120: %d, Mic120-240: %d, Mic240-0: %d\n", delay_0_120_fft, delay_120_240_fft, delay_240_0_fft);
+                printf("Estimated Angle from LUT: %d deg, Error: %d\n", best_angle_index, min_error);
+                printf("Estimated Angle from FFT LUT: %d deg, Error: %d\n", best_angle_index_fft, min_error_fft);
+
+                // // Run Cross-Correlation
+                // int sample_delay = calculate_sample_delay(linear_mic_0, linear_mic_120);
+                // int sample_delay_fft = calculate_sample_delay_fft(buffer_fft_0, buffer_fft_120);
+                // // test third mic delay
+                // int sample_delay_240 = calculate_sample_delay(linear_mic_0, linear_mic_240);
+
+                // char display_buf[32];
+                // snprintf(display_buf, sizeof(display_buf), "Delay: %d", sample_delay);
+
+                // // Update OLED based on results
+                // ssd1306_clear_display(dev_hdl, false);
+                // if (sample_delay > 0) {
+                //     ssd1306_display_text(dev_hdl, 0, "Right ->", false);
+                // } else if (sample_delay < 0) {
+                //     ssd1306_display_text(dev_hdl, 0, "Left <-", false);
+                // } else {
+                //     ssd1306_display_text(dev_hdl, 0, "Center", false);
+                // }
+                // ssd1306_display_text(dev_hdl, 2, display_buf, false);
+                // snprintf(display_buf, sizeof(display_buf), "FFT Delay: %d", sample_delay_fft);
+                // ssd1306_display_text(dev_hdl, 4, display_buf, false);
+
+                // snprintf(display_buf, sizeof(display_buf), "Delay 240: %d", sample_delay_240);
+                // ssd1306_display_text(dev_hdl, 6, display_buf, false);
 
 
                 // Pause to read, then reset
