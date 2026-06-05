@@ -9,13 +9,23 @@
 #include "ssd1306.h"
 #include "tdoa_lut.h" // Include the TDOA lookup table tdoa_lut[360][3] where tdoa_lut[angle][delays]
 
+
+
 // ============================================================================
 //  HARDWARE PIN DEFINITIONS
 // ============================================================================
 
 // I2C Pins (OLED Display)
-#define I2C_SCL 10
-#define I2C_SDA 11
+#define I2C_SCL_PIN 10
+#define I2C_SDA_PIN 11
+#define I2C_RESET_PIN -1
+
+// Screen dimensions and center anchors
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define CENTER_X      64
+#define CENTER_Y      32
+#define ARROW_LEN     22
 
 // I2S Pins (Microphones)
 #define I2S_SCK_IO       (4)  // Shared Clock
@@ -39,7 +49,7 @@
 
 typedef enum {
     STATE_LISTENING,       // Constantly filling ring buffer, waiting for noise
-    STATE_POST_TRIGGER,    // Trigger hit! Recording the tail end of the sound
+    STATE_POST_TRIGGER,    // Trigger hit, Recording the tail end of the sound
     STATE_PROCESSING       // Buffer frozen. Ready for math.
 } system_state_t;
 
@@ -55,24 +65,13 @@ float captured_mic_0[CAPTURE_SIZE];
 float captured_mic_120[CAPTURE_SIZE];
 float captured_mic_240[CAPTURE_SIZE];
 
-// alias for old name backwards compatibility with existing code
-#define captured_left captured_mic_0
-#define captured_right captured_mic_120
-
 // Linear buffers for DSP processing
 float linear_mic_0[CAPTURE_SIZE];
 float linear_mic_120[CAPTURE_SIZE];
 float linear_mic_240[CAPTURE_SIZE];
 
-//alias for old name backwards compatibility with existing code
-#define linear_left linear_mic_0
-#define linear_right linear_mic_120
-
 int ring_index = 0; 
 int post_trigger_count = 0;
-
-// Global display handle
-ssd1306_handle_t dev_hdl = NULL;
 
 // ============================================================================
 //  GLOBAL STATE & BUFFERS FOR FFT APPROACH
@@ -84,68 +83,9 @@ float buffer_fft_240[CAPTURE_SIZE * 2];
 float cross_corr_buffer[CAPTURE_SIZE * 2];
 
 
-
 // ============================================================================
 //  HARDWARE INITIALIZATION HELPERS
 // ============================================================================
-
-void init_oled_display() {
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = I2C_SDA,
-        .scl_io_num = I2C_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    
-    i2c_master_bus_handle_t i2c_bus_hdl;
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &i2c_bus_hdl));
-
-    ssd1306_config_t dev_cfg = I2C_SSD1306_128x64_CONFIG_DEFAULT;
-    ssd1306_init(i2c_bus_hdl, &dev_cfg, &dev_hdl);
-
-    if (dev_hdl != NULL) {
-        ssd1306_clear_display(dev_hdl, false);
-        ssd1306_set_contrast(dev_hdl, 0xFF);
-        ssd1306_display_text(dev_hdl, 0, "System Ready", false);
-    } else {
-        printf("SSD1306 Init Failed\n");
-    }
-}
-
-i2s_chan_handle_t init_i2s_microphones() {
-    i2s_chan_handle_t rx_handle_master;
-
-    // FUTURE: We will add rx_handle_slave here for the 3rd mic
-
-    // Configure I2S Channel (Master for Mics 1 & 2)
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_handle_master));
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = I2S_SCK_IO,
-            .ws   = I2S_WS_IO,
-            .dout = I2S_GPIO_UNUSED,
-            .din  = I2S_SD_MICS_1_2,
-            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
-        },
-    };
-
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle_master, &std_cfg));
-    
-    // FUTURE: Init Slave controller here
-
-    // FUTURE: Enable Slave first, then Master to sync clocks
-    ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_master));
-    
-    printf("I2S initialized successfully.\n");
-    return rx_handle_master;
-}
 
 void init_microphones_multichannel(i2s_chan_handle_t *master_hdl, i2s_chan_handle_t *slave_hdl) {
 
@@ -202,6 +142,15 @@ void init_microphones_multichannel(i2s_chan_handle_t *master_hdl, i2s_chan_handl
 
 }
 
+void init_oled_display(SSD1306_t *dev) {
+
+    i2c_master_init(dev, I2C_SDA_PIN, I2C_SCL_PIN, I2C_RESET_PIN);
+
+    ssd1306_init(dev, SCREEN_WIDTH, SCREEN_HEIGHT);
+
+    ssd1306_contrast(dev, 0xff);
+}
+
 
 // ============================================================================
 //  DSP & MATH HELPERS
@@ -238,78 +187,121 @@ int calculate_sample_delay(float *linear_a, float *linear_b) {
 
 
 
-int calculate_sample_delay_fft(float *buffer_A, float *buffer_B) {
-    // Forward FFTs 
-    dsps_fft4r_fc32(buffer_A, CAPTURE_SIZE);
-    dsps_fft4r_fc32(buffer_B, CAPTURE_SIZE);
+// int calculate_sample_delay_fft(float *buffer_A, float *buffer_B) {
+//     // Forward FFTs 
+//     dsps_fft4r_fc32(buffer_A, CAPTURE_SIZE);
+//     dsps_fft4r_fc32(buffer_B, CAPTURE_SIZE);
 
-    // Unscramble both buffers to linear frequency order
-    dsps_bit_rev4r_fc32(buffer_A, CAPTURE_SIZE);
-    dsps_bit_rev4r_fc32(buffer_B, CAPTURE_SIZE);
+//     // Unscramble both buffers to linear frequency order
+//     dsps_bit_rev4r_fc32(buffer_A, CAPTURE_SIZE);
+//     dsps_bit_rev4r_fc32(buffer_B, CAPTURE_SIZE);
 
-    // The Math Loop (Conjugate A, Multiply by B, PHAT Normalize)
-    for (int i = 0; i < CAPTURE_SIZE; i++) {
-        int r_idx = i * 2;
-        int i_idx = i * 2 + 1;
+//     // The Math Loop (Conjugate A, Multiply by B, PHAT Normalize)
+//     for (int i = 0; i < CAPTURE_SIZE; i++) {
+//         int r_idx = i * 2;
+//         int i_idx = i * 2 + 1;
 
-        // Handle DC Bin Separately (i=0)
-        if (i == 0) {
-            cross_corr_buffer[r_idx] = 0.0f; // Array index 0 (Real part of DC)
-            cross_corr_buffer[i_idx] = 0.0f; // Array index 1 (Imag part of DC)
-            continue; // Skip the rest of the math for this bin and move to i = 1
-        }
+//         // Handle DC Bin Separately (i=0)
+//         if (i == 0) {
+//             cross_corr_buffer[r_idx] = 0.0f; // Array index 0 (Real part of DC)
+//             cross_corr_buffer[i_idx] = 0.0f; // Array index 1 (Imag part of DC)
+//             continue; // Skip the rest of the math for this bin and move to i = 1
+//         }
 
-        float rA = buffer_A[r_idx];
-        float iA = buffer_A[i_idx];
-        float rB = buffer_B[r_idx];
-        float iB = buffer_B[i_idx];
+//         float rA = buffer_A[r_idx];
+//         float iA = buffer_A[i_idx];
+//         float rB = buffer_B[r_idx];
+//         float iB = buffer_B[i_idx];
 
-        // Complex multiply with Conjugate A: (rA - j*iA) * (rB + j*iB)
-        float cross_real = (rA * rB) + (iA * iB);
-        float cross_imag = (rA * iB) - (iA * rB);
+//         // Complex multiply with Conjugate A: (rA - j*iA) * (rB + j*iB)
+//         float cross_real = (rA * rB) + (iA * iB);
+//         float cross_imag = (rA * iB) - (iA * rB);
 
-        // PHAT Trick: Calculate magnitude for normalization
-        float magnitude = sqrtf((cross_real * cross_real) + (cross_imag * cross_imag));
+//         // PHAT Trick: Calculate magnitude for normalization
+//         float magnitude = sqrtf((cross_real * cross_real) + (cross_imag * cross_imag));
 
-        if (magnitude > 1e-6f) { // Prevent divide-by-zero on pure silence
-            cross_corr_buffer[r_idx] = cross_real / magnitude;
+//         if (magnitude > 1e-6f) { // Prevent divide-by-zero on pure silence
+//             cross_corr_buffer[r_idx] = cross_real / magnitude;
             
-            // We make the imaginary part negative.
-            // This conjugate acts as the first mathematical step of the Inverse FFT
-            cross_corr_buffer[i_idx] = -cross_imag / magnitude; 
-        } else {
-            cross_corr_buffer[r_idx] = 0.0f;
-            cross_corr_buffer[i_idx] = 0.0f;
-        }
-    }
+//             // We make the imaginary part negative.
+//             // This conjugate acts as the first mathematical step of the Inverse FFT
+//             cross_corr_buffer[i_idx] = -cross_imag / magnitude; 
+//         } else {
+//             cross_corr_buffer[r_idx] = 0.0f;
+//             cross_corr_buffer[i_idx] = 0.0f;
+//         }
+//     }
 
-    // Run STANDARD Forward FFT (This acts as our IFFT)
-    dsps_fft4r_fc32(cross_corr_buffer, CAPTURE_SIZE);
+//     // Run STANDARD Forward FFT (This acts as our IFFT)
+//     dsps_fft4r_fc32(cross_corr_buffer, CAPTURE_SIZE);
 
-    // Unscramble the time-domain result
-    dsps_bit_rev4r_fc32(cross_corr_buffer, CAPTURE_SIZE);
+//     // Unscramble the time-domain result
+//     dsps_bit_rev4r_fc32(cross_corr_buffer, CAPTURE_SIZE);
 
-    // Find the Peak (Time Difference of Arrival)
-    float max_val = -99999999.0f;
-    int max_index = 0;
+//     // Find the Peak (Time Difference of Arrival)
+//     float max_val = -99999999.0f;
+//     int max_index = 0;
 
-    // Scan only the Real parts of the time-domain output
-    for (int i = 0; i < CAPTURE_SIZE; i++) {
-        float val = cross_corr_buffer[i * 2]; 
+//     // Scan only the Real parts of the time-domain output
+//     for (int i = 0; i < CAPTURE_SIZE; i++) {
+//         float val = cross_corr_buffer[i * 2]; 
 
-        if (val > max_val) {
-            max_val = val;
-            max_index = i;
-        }
-    }
+//         if (val > max_val) {
+//             max_val = val;
+//             max_index = i;
+//         }
+//     }
 
-    // Handle Negative Delays (Wrapping)
-    int delay = max_index;
-    if (delay > CAPTURE_SIZE / 2) {
-        delay -= CAPTURE_SIZE;
-    }
+//     // Handle Negative Delays (Wrapping)
+//     int delay = max_index;
+//     if (delay > CAPTURE_SIZE / 2) {
+//         delay -= CAPTURE_SIZE;
+//     }
 
-    return delay;
+//     return delay;
+// }
+
+// ============================================================================
+// OLED DISPLAY HELPERS
+// ============================================================================
+
+void draw_direction_arrow(SSD1306_t *dev, float angle_deg) {
+    // 0. Convert degrees to radians
+    // Formula: radians = degrees * (PI / 180)
+    float shifted_deg = angle_deg - 90.0f;
+    float angle_rad = shifted_deg * (M_PI / 180.0f);
+
+    // 1. Clear the screen buffer before drawing the new frame
+    ssd1306_clear_screen(dev, false);
+
+    // 2. Calculate the main arrow tip coordinate
+    // FIX: Add the sine component instead of subtracting to properly 
+    // orient 0 degrees towards the top of the inverted OLED Y-axis.
+    int target_x = CENTER_X + (int)(ARROW_LEN * cosf(angle_rad));
+    int target_y = CENTER_Y + (int)(ARROW_LEN * sinf(angle_rad));
+
+    // 3. Draw the main arrow shaft from center to the target tip
+    _ssd1306_line(dev, CENTER_X, CENTER_Y, target_x, target_y, false);
+
+    // 4. Calculate arrowhead wings (offset backwards by roughly 145 degrees / 2.5 rads)
+    float left_wing_angle = angle_rad + 2.5f;
+    float right_wing_angle = angle_rad - 2.5f;
+    int wing_len = 7;
+
+    int left_x = target_x + (int)(wing_len * cosf(left_wing_angle));
+    // FIX: Apply the same addition fix to the wings so they render in the right direction
+    int left_y = target_y + (int)(wing_len * sinf(left_wing_angle)); 
+
+    int right_x = target_x + (int)(wing_len * cosf(right_wing_angle));
+    // FIX: Apply the same addition fix to the wings
+    int right_y = target_y + (int)(wing_len * sinf(right_wing_angle)); 
+
+    // 5. Draw the arrowhead wings to the screen buffer
+    _ssd1306_line(dev, target_x, target_y, left_x, left_y, false);
+    _ssd1306_line(dev, target_x, target_y, right_x, right_y, false);
+
+    // 6. Push the updated frame-buffer content to the physical display
+    ssd1306_show_buffer(dev);
 }
 
 
@@ -320,18 +312,15 @@ int calculate_sample_delay_fft(float *buffer_A, float *buffer_B) {
 void i2s_microphone_task(void *pvParameters) {
 
     // Initialize oled
-    init_oled_display();
+    SSD1306_t dev;
+    init_oled_display(&dev);
 
     // Initialize I2S
-    // i2s_chan_handle_t rx_handle = init_i2s_microphones();
     i2s_chan_handle_t rx_handle_master, rx_handle_slave;
     init_microphones_multichannel(&rx_handle_master, &rx_handle_slave);
 
     size_t bytes_read_master = 0;
     size_t bytes_read_slave = 0;
-
-    ssd1306_clear_display(dev_hdl, false);
-    ssd1306_display_text(dev_hdl, 0, "Listening...", false);
 
     // Initialize the complex FFT tables. 
     // Do this once 
@@ -341,6 +330,7 @@ void i2s_microphone_task(void *pvParameters) {
         printf("Fatal Error: Could not initialize DSP FFT tables!\n");
         return;
     }
+
 
     while (1) {
         // Read from I2S Master
@@ -424,74 +414,37 @@ void i2s_microphone_task(void *pvParameters) {
                 int delay_120_240 = calculate_sample_delay(linear_mic_120, linear_mic_240); // tdoa_lut[i][1] is mic 120 to mic 240 delay
                 int delay_240_0 = calculate_sample_delay(linear_mic_240, linear_mic_0); // tdoa_lut[i][2] is mic 240 to mic 0 delay
 
-                int delay_0_120_fft = calculate_sample_delay_fft(buffer_fft_0, buffer_fft_120); // tdoa_lut[i][0] is mic 0 to mic 120 delay
-                int delay_120_240_fft = calculate_sample_delay_fft(buffer_fft_120, buffer_fft_240); // tdoa_lut[i][1] is mic 120 to mic 240 delay
-                int delay_240_0_fft = calculate_sample_delay_fft(buffer_fft_240, buffer_fft_0); // tdoa_lut[i][2] is mic 240 to mic 0 delay
+                // int delay_0_120_fft = calculate_sample_delay_fft(buffer_fft_0, buffer_fft_120); // tdoa_lut[i][0] is mic 0 to mic 120 delay
+                // int delay_120_240_fft = calculate_sample_delay_fft(buffer_fft_120, buffer_fft_240); // tdoa_lut[i][1] is mic 120 to mic 240 delay
+                // int delay_240_0_fft = calculate_sample_delay_fft(buffer_fft_240, buffer_fft_0); // tdoa_lut[i][2] is mic 240 to mic 0 delay
 
                 // find degree index in LUT that best matches our observed delays
                 int best_angle_index = 0;
                 int min_error = 999999;
-                int best_angle_index_fft = 0;
-                int min_error_fft = 999999;
+                // int best_angle_index_fft = 0;
+                // int min_error_fft = 999999;
                 for (int i = 0; i < 360; i++) {
                     int error = abs(tdoa_lut[i][0] - delay_0_120) + abs(tdoa_lut[i][1] - delay_120_240) + abs(tdoa_lut[i][2] - delay_240_0);
                     if (error < min_error) {
                         min_error = error;
                         best_angle_index = i;
                     }
-                    int error_fft = abs(tdoa_lut[i][0] - delay_0_120_fft) + abs(tdoa_lut[i][1] - delay_120_240_fft) + abs(tdoa_lut[i][2] - delay_240_0_fft);
-                    if (error_fft < min_error_fft) {
-                        min_error_fft = error_fft;
-                        best_angle_index_fft = i;
-                    }
+                    // int error_fft = abs(tdoa_lut[i][0] - delay_0_120_fft) + abs(tdoa_lut[i][1] - delay_120_240_fft) + abs(tdoa_lut[i][2] - delay_240_0_fft);
+                    // if (error_fft < min_error_fft) {
+                    //     min_error_fft = error_fft;
+                    //     best_angle_index_fft = i;
+                    // }
                 }
 
-                // print results to oled
-                ssd1306_clear_display(dev_hdl, false);
-                ssd1306_display_text(dev_hdl, 0, "Regular:", false);
-                char display_buf[32];
-                snprintf(display_buf, sizeof(display_buf), "Angle: %d deg", best_angle_index);
-                ssd1306_display_text(dev_hdl, 2, display_buf, false);
-                ssd1306_display_text(dev_hdl, 4, "FFT:", false);
-                snprintf(display_buf, sizeof(display_buf), "Angle: %d deg", best_angle_index_fft);
-                ssd1306_display_text(dev_hdl, 6, display_buf, false);
-                
+                draw_direction_arrow(&dev, (float)best_angle_index);                
 
                 // print to console for debugging
                 printf("Cross-Correlation Delays (Samples): Mic0-120: %d, Mic120-240: %d, Mic240-0: %d\n", delay_0_120, delay_120_240, delay_240_0);
-                printf("FFT Cross-Correlation Delays (Samples): Mic0-120: %d, Mic120-240: %d, Mic240-0: %d\n", delay_0_120_fft, delay_120_240_fft, delay_240_0_fft);
+                // printf("FFT Cross-Correlation Delays (Samples): Mic0-120: %d, Mic120-240: %d, Mic240-0: %d\n", delay_0_120_fft, delay_120_240_fft, delay_240_0_fft);
                 printf("Estimated Angle from LUT: %d deg, Error: %d\n", best_angle_index, min_error);
-                printf("Estimated Angle from FFT LUT: %d deg, Error: %d\n", best_angle_index_fft, min_error_fft);
-
-                // // Run Cross-Correlation
-                // int sample_delay = calculate_sample_delay(linear_mic_0, linear_mic_120);
-                // int sample_delay_fft = calculate_sample_delay_fft(buffer_fft_0, buffer_fft_120);
-                // // test third mic delay
-                // int sample_delay_240 = calculate_sample_delay(linear_mic_0, linear_mic_240);
-
-                // char display_buf[32];
-                // snprintf(display_buf, sizeof(display_buf), "Delay: %d", sample_delay);
-
-                // // Update OLED based on results
-                // ssd1306_clear_display(dev_hdl, false);
-                // if (sample_delay > 0) {
-                //     ssd1306_display_text(dev_hdl, 0, "Right ->", false);
-                // } else if (sample_delay < 0) {
-                //     ssd1306_display_text(dev_hdl, 0, "Left <-", false);
-                // } else {
-                //     ssd1306_display_text(dev_hdl, 0, "Center", false);
-                // }
-                // ssd1306_display_text(dev_hdl, 2, display_buf, false);
-                // snprintf(display_buf, sizeof(display_buf), "FFT Delay: %d", sample_delay_fft);
-                // ssd1306_display_text(dev_hdl, 4, display_buf, false);
-
-                // snprintf(display_buf, sizeof(display_buf), "Delay 240: %d", sample_delay_240);
-                // ssd1306_display_text(dev_hdl, 6, display_buf, false);
+                // printf("Estimated Angle from FFT LUT: %d deg, Error: %d\n", best_angle_index_fft, min_error_fft);
 
 
-                // Pause to read, then reset
-                // vTaskDelay(pdMS_TO_TICKS(1000));
-                // ssd1306_display_text(dev_hdl, 4, "Listening...", false);
                 current_state = STATE_LISTENING;
             }
         }
